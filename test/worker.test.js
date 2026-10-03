@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import worker, { DailyEditor, nextStart, selectPosts, validateSummary, renderPost, MINUTE, DAY, INTERVAL } from '../src/worker.js';
 import { chooseMix, parseLabels } from '../src/audience.js';
+import { EDITORIAL_VERSION, selectComments, validateDiscussion, GAMING_CORRECTION } from '../src/discussion.js';
 
 const now = Date.parse('2026-10-03T00:00:00Z');
 const post = (id, extra = {}) => ({ id, title: 'A distinct post ' + id, content: 'source', created_at: new Date(now - MINUTE).toISOString(), upvotes: 100, comment_count: 50, author: { name: 'agent' }, ...extra });
@@ -18,7 +19,7 @@ function harness(state) {
   const obj = new DailyEditor({ storage }, { TELEGRAM_BOT_TOKEN: 'test', TELEGRAM_CHAT_ID: '-100test', DAILY_START: '04:00' });
   return { obj, state: () => { const s = structuredClone(values.get('state')); if (s.itemIds) s.items = s.itemIds.map(id => structuredClone(values.get('item:'+id))); return s; }, alarm: () => alarm };
 }
-const base = () => ({ enabled: true, items: [], seen: [], batches: [], errors: [], lastAttempt: 0, nextCollection: Date.now() + DAY, nextStart: Date.now() + DAY });
+const base = () => ({ editorialVersion: EDITORIAL_VERSION, enabled: true, items: [], seen: [], batches: [], errors: [], lastAttempt: 0, nextCollection: Date.now() + DAY, nextStart: Date.now() + DAY });
 const item = (id, dueAt = Date.now() - MINUTE) => ({ id, post: post(id), editorial, status: 'queued', dueAt, collectedAt: now });
 
 test('Tehran cycle crosses UTC midnight correctly and 15 posts have 90-minute gaps', () => {
@@ -153,4 +154,34 @@ test('public requests cannot read queue or trigger actions', async () => {
   assert.equal((await worker.fetch(new Request('https://example/admin/status'), { ADMIN_TOKEN: 'secret' })).status, 401);
   assert.equal((await worker.fetch(new Request('https://example/health'), {})).status, 200);
   assert.equal((await worker.fetch(new Request('https://example/admin/start', { headers: { Authorization: 'Bearer secret' } }), { ADMIN_TOKEN: 'secret' })).status, 405);
+});
+
+test('reply selection keeps parent attribution and author replies while limiting repetitive commenters',()=>{
+  const source=[{id:'root',author:{name:'second'},content:'A real experience',upvotes:2,replies:[
+    ...Array.from({length:10},(_,i)=>({id:'spam'+i,author:{name:'repeater'},content:'Repeated question '+i,replies:[]})),
+    {id:'reply',author:{name:'writer'},content:'A substantive answer',replies:[{id:'followup',author:{name:'second'},content:'Follow-up',replies:[]}]},
+  ]}];
+  const result=selectComments(source,'writer');
+  assert.equal(result[1].id,'reply'); assert.equal(result[2].id,'followup');
+  assert.equal(result[2].parent_author,'writer'); assert.ok(result.filter(x=>x.author==='repeater').length<=3);
+});
+test('discussion attribution cannot be invented or overridden by the model',()=>{
+  const source=[{id:'real',author:'real-author',parent_id:'parent',parent_author:'other',text:'source'}];
+  const summary='می‌گه گاهی انسانش فقط می‌خواد از تماشای فیلم لذت ببره و نیازی به ساختن چیز تازه‌ای نیست.';
+  const result=validateDiscussion([{id:'real',author:'imposter',summary}],source);
+  assert.equal(result[0].author,'real-author'); assert.equal(result[0].parent_author,'other');
+  assert.throws(()=>validateDiscussion([{id:'invented',summary}],source));
+  assert.throws(()=>validateDiscussion([{id:'real',summary},{id:'real',summary}],source));
+  assert.deepEqual(validateDiscussion([],[]),[]);
+});
+test('editorial migration rewrites unsent items once and preserves delivered messages',async()=>{
+  const s=base(); s.editorialVersion=0; s.items=[{...item('sent'),status:'sent',messageId:5},item('next',Date.now()+INTERVAL)];
+  const h=harness(s); let prepared=0;
+  h.obj.prepare=async i=>{prepared++;i.editorial=editorial;i.status='queued';i.editorialVersion=EDITORIAL_VERSION;};
+  await h.obj.tick();await h.obj.tick();
+  assert.equal(prepared,1); assert.equal(h.state().items[0].messageId,5); assert.equal(h.state().items[0].status,'sent');
+});
+test('reviewed gaming correction and its discussion fit a single Telegram post',()=>{
+  const i=item('gaming'); i.editorial={...validateSummary(GAMING_CORRECTION),discussion:validateDiscussion(GAMING_CORRECTION.discussion,GAMING_CORRECTION.discussion.map((x,n)=>({id:x.id,author:n===1?'triii':'manty',parent_author:n>0?'triii':null})))};
+  assert.ok(renderPost(i).length<4000); assert.match(renderPost(i),/انسانش/); assert.match(renderPost(i),/زیر پست/);
 });
