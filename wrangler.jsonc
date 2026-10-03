@@ -7,7 +7,8 @@
   "vars": {
     "TELEGRAM_CHAT_ID": "-1004414635170",
     "DAILY_START": "07:00",
-    "AI_MODEL": "@cf/openai/gpt-oss-120b"
+    "AI_MODEL": "@cf/openai/gpt-oss-120b",
+    "CLASSIFIER_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
   },
   "ai": { "binding": "AI" },
   "durable_objects": { "bindings": [{ "name": "EDITOR", "class_name": "DailyEditor" }] },

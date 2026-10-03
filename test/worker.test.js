@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import worker, { DailyEditor, nextStart, selectPosts, validateSummary, renderPost, MINUTE, DAY, INTERVAL } from '../src/worker.js';
+import { chooseMix, parseLabels } from '../src/audience.js';
 
 const now = Date.parse('2026-10-03T00:00:00Z');
 const post = (id, extra = {}) => ({ id, title: 'A distinct post ' + id, content: 'source', created_at: new Date(now - MINUTE).toISOString(), upvotes: 100, comment_count: 50, author: { name: 'agent' }, ...extra });
@@ -101,10 +102,51 @@ test('daily collection is persisted and not repeated on subsequent ticks', async
   try {
     const s = base(); s.nextCollection = 0; s.nextStart = Date.now() + INTERVAL;
     const h = harness(s); h.obj.prepare = async i => { i.editorial = editorial; i.status = 'queued'; };
+    h.obj.discover = async () => { feedCalls++; return { candidates:[{...post('unique'),category:'human',appeal:4,trend_score:1}],hotCount:1,risingCount:1,screenedCount:1 }; };
     await h.obj.tick(); await h.obj.tick();
-    assert.equal(feedCalls, 2); assert.equal(h.state().batches.length, 1); assert.equal(h.state().items.length, 1);
+    assert.equal(feedCalls, 1); assert.equal(h.state().batches.length, 1); assert.equal(h.state().items.length, 1);
     assert.equal(h.state().nextCollection, s.nextStart + DAY - 30 * MINUTE);
   } finally { globalThis.fetch = oldFetch; }
+});
+
+function audiencePool(g = 20, t = 10) {
+  return Array.from({length:g+t},(_,i)=>({...post('mix'+i),author:{name:'author'+i},category:i<g ? ['human','rights','fun','business','finance'][i%5] : 'technical', appeal:4, trend_score:1/(i+1)}));
+}
+test('audience mix has at least 11 general posts and no more than 4 technical per 15',()=>{
+  const result=chooseMix(audiencePool()); assert.equal(result.length,15);
+  assert.equal(result.filter(x=>x.category==='technical').length,4);
+  for(let i=1;i<=result.length;i++) assert.ok(result.slice(0,i).filter(x=>x.category==='technical').length/i<=.3);
+});
+test('technical shortage is filled with general stories; general shortage never breaks the cap',()=>{
+  assert.equal(chooseMix(audiencePool(20,0)).length,15);
+  const short=chooseMix(audiencePool(5,20));
+  assert.equal(short.length,7); assert.ok(short.filter(x=>x.category==='technical').length/short.length<=.3);
+  assert.equal(chooseMix(audiencePool(0,30)).length,0);
+});
+test('rebuild includes existing technical delivery in the daily cap',()=>{
+  const fixed=[{...post('sent'),category:'technical'}];
+  const result=chooseMix(audiencePool(),15,fixed);
+  assert.equal(result.length,14); assert.equal(result.filter(x=>x.category==='technical').length,3);
+});
+test('classification rejects invented indices, missing labels, duplicates and low-interest or skipped posts',()=>{
+  const result=parseLabels(JSON.stringify({items:[{i:0,category:'human',appeal:4},{i:0,category:'rights',appeal:5},{i:500,category:'human',appeal:4},{i:1,category:'skip',appeal:5},{i:2,category:'fun',appeal:2}]}),[post('a'),post('b'),post('c')]);
+  assert.deepEqual(result.map(x=>x.id),['a']);
+});
+test('technical publication is held when failed general stories would violate the actual delivery mix',async()=>{
+  const s=base(); s.items=[{...item('tech'),category:'technical',batch:123}];
+  const h=harness(s); await h.obj.tick(); assert.equal(h.state().items[0].status,'skipped_quota');
+});
+test('recuration preserves sent message and rebuilds only future slots, including its technical budget',async()=>{
+  const s=base(),start=Date.now()-10*MINUTE;
+  s.rebuildRequested=start; s.batches=[{start,count:15}];
+  s.items=[{...item('sent',start),rank:1,batch:start,status:'sent',messageId:77},{...item('old',start+INTERVAL),rank:2,batch:start}];
+  s.seen=[{id:'sent',at:Date.now()},{id:'old',at:Date.now()}];
+  const h=harness(s); h.obj.discover=async()=>({candidates:audiencePool(),screenedCount:30});
+  await h.obj.rebuild(s,Date.now());
+  const saved=h.state(); assert.equal(saved.items.length,15); assert.equal(saved.items[0].messageId,77);
+  assert.ok(!saved.items.some(i=>i.id==='old')); assert.equal(saved.batches[0].technicalCount,4);
+  assert.equal(saved.batches[0].generalCount,11); assert.equal(saved.items[1].dueAt,start+INTERVAL);
+  assert.ok(!saved.rebuildRequested);
 });
 
 test('public requests cannot read queue or trigger actions', async () => {
