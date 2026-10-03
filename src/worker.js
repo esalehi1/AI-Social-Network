@@ -8,6 +8,25 @@ const SOURCE = 'https://www.moltbook.com/api/v1';
 const DAILY_COUNT = 15;
 const json = (data, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store' } });
 
+export function recoverReadySlot(state, now) {
+  if (now - state.lastAttempt < INTERVAL) return null;
+  const current = state.items.find(i => i.dueAt <= now && now < i.dueAt + INTERVAL && ['pending','failed','queued'].includes(i.status));
+  if (!current) return null;
+  const delivered = state.items.filter(i => i.batch === current.batch && ['sent','sending','unknown'].includes(i.status));
+  const technical = delivered.filter(i => !i.category || i.category === 'technical').length;
+  const allowed = i => i.category && i.category !== 'technical' || (technical + 1) / (delivered.length + 1) <= .3;
+  if (current.status === 'queued' && current.editorial && allowed(current)) return null;
+  const ready = state.items.filter(i => i.batch === current.batch && i.dueAt > now && i.status === 'queued' && i.editorial && allowed(i))
+    .sort((a,b) => a.dueAt - b.dueAt)[0];
+  if (!ready) return null;
+  const from = ready.dueAt, to = current.dueAt;
+  for (const i of [ready,current]) { i.originalDueAt ??= i.dueAt; i.rescheduledAt = now; }
+  [ready.dueAt,current.dueAt] = [current.dueAt,ready.dueAt];
+  [ready.rank,current.rank] = [current.rank,ready.rank];
+  state.items.sort((a,b) => a.dueAt - b.dueAt);
+  return {id:ready.id,displaced:current.id,from,to};
+}
+
 export function nextStart(now, clock = '04:00') {
   if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(clock)) throw new Error('Invalid DAILY_START');
   const [hour, minute] = clock.split(':').map(Number);
@@ -351,6 +370,7 @@ export class DailyEditor {
   }
   async tick() {
     const state = await this.load();
+    console.log(JSON.stringify({event:'queue_snapshot',enabled:state.enabled,lastAttempt:state.lastAttempt,slots:state.items.map(i=>({id:i.id,rank:i.rank,batch:i.batch,dueAt:i.dueAt,status:i.status,category:i.category,ready:!!i.editorial,messageId:i.messageId,attempts:i.attempts,failure:i.failure})),errors:state.errors.slice(-5)}));
     if (!state.enabled) return;
     const now = Date.now();
     if ((state.editorialVersion || 0) < EDITORIAL_VERSION) {
@@ -378,6 +398,11 @@ export class DailyEditor {
       if (now >= state.nextCollection) {
         try { await this.collect(state, now); }
         catch (error) { this.note(state, 'collection', error); state.nextCollection = now + 15 * MINUTE; }
+      }
+      const recovered = recoverReadySlot(state,now);
+      if (recovered) {
+        await this.save(state);
+        console.log(JSON.stringify({event:'slot_recovered',...recovered}));
       }
       const due = state.items.find(i => i.status === 'queued' && i.dueAt <= now);
       if (due && now - state.lastAttempt >= INTERVAL) {

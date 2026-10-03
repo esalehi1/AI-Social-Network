@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import worker, { DailyEditor, nextStart, selectPosts, validateSummary, renderPost, MINUTE, DAY, INTERVAL } from '../src/worker.js';
+import worker, { DailyEditor, nextStart, selectPosts, validateSummary, renderPost, recoverReadySlot, MINUTE, DAY, INTERVAL } from '../src/worker.js';
 import { chooseMix, parseLabels } from '../src/audience.js';
 import { EDITORIAL_VERSION, selectComments, validateDiscussion, GAMING_CORRECTION, MORNING_POST_ID } from '../src/discussion.js';
 
@@ -21,6 +21,52 @@ function harness(state) {
 }
 const base = () => ({ editorialVersion: EDITORIAL_VERSION, enabled: true, items: [], seen: [], batches: [], errors: [], lastAttempt: 0, nextCollection: Date.now() + DAY, nextStart: Date.now() + DAY });
 const item = (id, dueAt = Date.now() - MINUTE) => ({ id, post: post(id), editorial, status: 'queued', dueAt, collectedAt: now });
+
+test('failed current slot uses a ready future story once without another AI request', async () => {
+  const at = Date.now(), s = base();
+  const failed = {...item('failed',at-15*MINUTE),status:'failed',editorial:undefined,attempts:4,rank:7,batch:123,category:'human'};
+  const ready = {...item('ready',at+2*INTERVAL),rank:9,batch:123,category:'fun'};
+  const sent = {...item('sent',at-2*INTERVAL),status:'sent',messageId:77,batch:123,category:'human'};
+  s.items=[sent,failed,ready]; s.lastAttempt=at-2*INTERVAL;
+  const h=harness(s), oldFetch=globalThis.fetch;let calls=0;
+  h.obj.prepare=async()=>{throw new Error('Recovery must not regenerate stored text');};
+  globalThis.fetch=async()=>{calls++;return Response.json({ok:true,result:{message_id:78}});};
+  try {
+    await h.obj.locked(()=>h.obj.tick()); await h.obj.locked(()=>h.obj.tick());
+    const result=h.state();
+    assert.equal(calls,1);
+    assert.equal(result.items.find(i=>i.id==='ready').status,'sent');
+    assert.equal(result.items.find(i=>i.id==='ready').rank,7);
+    assert.equal(result.items.find(i=>i.id==='ready').dueAt,failed.dueAt);
+    assert.equal(result.items.find(i=>i.id==='failed').dueAt,ready.dueAt);
+    assert.equal(result.items.find(i=>i.id==='sent').messageId,77);
+  } finally {globalThis.fetch=oldFetch;}
+});
+
+test('slot recovery respects delivered technical ratio and can advance a general story',()=>{
+  const at=Date.now(),s=base();s.lastAttempt=at-2*INTERVAL;
+  s.items=[{...item('sent'),batch:1,status:'sent',category:'technical'},
+    {...item('current',at-MINUTE),batch:1,category:'technical',rank:2},
+    {...item('general',at+INTERVAL),batch:1,category:'human',rank:3}];
+  assert.equal(recoverReadySlot(s,at).id,'general');
+  assert.equal(s.items.find(i=>i.id==='current').rank,3);
+});
+
+test('recovery preserves cooldown, expired slots, uncertain delivery and later batches',()=>{
+  const at=Date.now();
+  for(const status of ['sent','sending','unknown','expired']) {
+    const s=base();s.lastAttempt=at-2*INTERVAL;
+    s.items=[{...item('current',at-MINUTE),status,batch:1}, {...item('ready',at+INTERVAL),batch:1,category:'fun'}];
+    assert.equal(recoverReadySlot(s,at),null);
+  }
+  const s=base();s.lastAttempt=at-MINUTE;
+  s.items=[{...item('current',at-MINUTE),status:'failed',batch:1}, {...item('ready',at+INTERVAL),batch:1,category:'fun'}];
+  assert.equal(recoverReadySlot(s,at),null);
+  s.lastAttempt=at-2*INTERVAL;s.items[0].dueAt=at-INTERVAL;
+  assert.equal(recoverReadySlot(s,at),null);
+  s.items[0].dueAt=at-MINUTE;s.items[1].batch=2;
+  assert.equal(recoverReadySlot(s,at),null);
+});
 
 test('Tehran cycle crosses UTC midnight correctly and 15 posts have 90-minute gaps', () => {
   const first = nextStart(now, '04:00');
