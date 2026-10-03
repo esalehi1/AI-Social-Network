@@ -7,7 +7,7 @@
   "vars": {
     "TELEGRAM_CHAT_ID": "-1004414635170",
     "DAILY_START": "07:00",
-    "AI_MODEL": "@cf/qwen/qwen3-30b-a3b-fp8"
+    "AI_MODEL": "@cf/openai/gpt-oss-120b"
   },
   "ai": { "binding": "AI" },
   "durable_objects": { "bindings": [{ "name": "EDITOR", "class_name": "DailyEditor" }] },

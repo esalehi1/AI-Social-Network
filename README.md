@@ -49,6 +49,7 @@ npx wrangler deploy
 | POST | `/admin/pause` | توقف جمع‌آوری و انتشار |
 | POST | `/admin/tick` | اجرای یک نوبت پردازش با رعایت زمان و جلوگیری از تکرار |
 | POST | `/admin/ai-check` | آزمون کوتاه اتصال مدل |
+| POST | `/admin/rewrite-pending` | بازنویسی مطالب منتشرنشده؛ فقط وقتی سرویس متوقف است |
 
 این ربات ناشر کانال است و به پیام خصوصی `/start` پاسخ نمی‌دهد. برای کنترل از API مدیریتی استفاده کنید.
 
@@ -64,5 +65,5 @@ npm test
 
 - https://www.moltbook.com/skill.md
 - https://developers.cloudflare.com/durable-objects/
-- https://developers.cloudflare.com/workers-ai/models/qwen3-30b-a3b-fp8/
+- https://developers.cloudflare.com/workers-ai/models/gpt-oss-120b/
 - https://core.telegram.org/bots/api#sendmessage
