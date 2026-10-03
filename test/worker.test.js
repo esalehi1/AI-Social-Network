@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import worker, { DailyEditor, nextStart, selectPosts, validateSummary, renderPost, MINUTE, DAY, INTERVAL } from '../src/worker.js';
 import { chooseMix, parseLabels } from '../src/audience.js';
-import { EDITORIAL_VERSION, selectComments, validateDiscussion, GAMING_CORRECTION } from '../src/discussion.js';
+import { EDITORIAL_VERSION, selectComments, validateDiscussion, GAMING_CORRECTION, MORNING_POST_ID } from '../src/discussion.js';
 
 const now = Date.parse('2026-10-03T00:00:00Z');
 const post = (id, extra = {}) => ({ id, title: 'A distinct post ' + id, content: 'source', created_at: new Date(now - MINUTE).toISOString(), upvotes: 100, comment_count: 50, author: { name: 'agent' }, ...extra });
@@ -184,4 +184,99 @@ test('editorial migration rewrites unsent items once and preserves delivered mes
 test('reviewed gaming correction and its discussion fit a single Telegram post',()=>{
   const i=item('gaming'); i.editorial={...validateSummary(GAMING_CORRECTION),discussion:validateDiscussion(GAMING_CORRECTION.discussion,GAMING_CORRECTION.discussion.map((x,n)=>({id:x.id,author:n===1?'triii':'manty',parent_author:n>0?'triii':null})))};
   assert.ok(renderPost(i).length<4000); assert.match(renderPost(i),/انسانش/); assert.match(renderPost(i),/زیر پست/);
+});
+
+test('main model never receives replies, and a reply retry reuses the cached main narrative',async()=>{
+  const oldFetch=globalThis.fetch, s=base(), h=harness(s);
+  const comment={id:'comment',author:{name:'reply-author'},content:'REPLY_ONLY_SENTINEL',replies:[]};
+  globalThis.fetch=async url=>Response.json(String(url).includes('/comments?') ? {comments:[comment]} : {post:post('isolated',{content:'MAIN_ONLY_SENTINEL'})});
+  let mainCalls=0,replyCalls=0;
+  h.obj.env.AI={run:async(_model,input)=>{
+    const data=JSON.parse(input.messages[1].content);
+    if ('source_text' in data) {
+      mainCalls++;
+      assert.equal(data.source_text,'MAIN_ONLY_SENTINEL');
+      assert.equal(data.comments,undefined);
+      assert.ok(!input.messages.some(m=>m.content.includes('REPLY_ONLY_SENTINEL')));
+      return {response:JSON.stringify(editorial)};
+    }
+    replyCalls++;
+    assert.equal(data.comments[0].text,'REPLY_ONLY_SENTINEL');
+    if (replyCalls===1) throw new Error('Temporary reply failure');
+    return {response:JSON.stringify({discussion:[{id:'comment',summary:'می‌گه انسانش ترجیح می‌ده خودش تصمیم بگیره و ربات فقط وقتی ازش کمک می‌خوان وارد ماجرا بشه.'}]})};
+  }};
+  const i=item('isolated');
+  try {
+    await assert.rejects(h.obj.prepare(i),/Temporary reply failure/);
+    await h.obj.prepare(i);
+    assert.equal(mainCalls,1);assert.equal(replyCalls,2);
+    assert.equal(i.editorial.summary,editorial.summary);
+    assert.equal(i.editorial.discussion[0].author,'reply-author');
+    const text=renderPost(i);
+    assert.ok(text.indexOf(editorial.summary)<text.indexOf('زیر پست چه خبر بود؟'));
+    assert.ok(text.indexOf(i.editorial.discussion[0].summary)>text.indexOf('زیر پست چه خبر بود؟'));
+  } finally {globalThis.fetch=oldFetch;}
+});
+
+test('mixed example correction edits its stored message once and preserves the reply section',async()=>{
+  const oldFetch=globalThis.fetch,s=base(),reply={id:'existing',author:'other',summary:'می‌گه پیام خودکار ممکنه حال واقعی انسانش در آن لحظه را منعکس نکنه و بهتره همراهش اطلاعاتی داشته باشه.'};
+  s.items=[{...item(MORNING_POST_ID),status:'sent',messageId:45,editorial:{...editorial,discussion:[reply]}}];
+  const h=harness(s);let edits=0;
+  h.obj.mainNarrative=async()=>editorial;
+  globalThis.fetch=async(url,options)=>{
+    if (!String(url).includes('editMessageText')) return Response.json({post:post(MORNING_POST_ID)});
+    edits++;
+    const body=JSON.parse(options.body);
+    assert.equal(body.message_id,45);assert.ok(body.text.includes(reply.summary));
+    return Response.json({ok:true});
+  };
+  try {
+    await h.obj.correctMixedExample(s);await h.obj.correctMixedExample(s);
+    assert.equal(edits,1);assert.equal(s.items[0].messageId,45);
+    assert.deepEqual(s.items[0].editorial.discussion,[reply]);assert.ok(s.morningCorrection.done);
+  } finally {globalThis.fetch=oldFetch;}
+});
+
+test('a post without comments uses only its independently generated main narrative',async()=>{
+  const oldFetch=globalThis.fetch,h=harness(base());let calls=0;
+  globalThis.fetch=async url=>Response.json(String(url).includes('/comments?') ? {comments:[]} : {post:post('no-replies')});
+  h.obj.env.AI={run:async(_model,input)=>{
+    calls++;const payload=JSON.parse(input.messages[1].content);
+    assert.equal(payload.source_text,'source');assert.equal(payload.comments,undefined);
+    return {response:JSON.stringify({...editorial,discussion:[{id:'invented'}]})};
+  }};
+  try {
+    const i=item('no-replies');await h.obj.prepare(i);
+    assert.equal(calls,1);assert.deepEqual(i.editorial,{...editorial,discussion:[]});
+    assert.equal(i.status,'queued');assert.ok(!renderPost(i).includes('زیر پست چه خبر بود؟'));
+  } finally {globalThis.fetch=oldFetch;}
+});
+
+test('missing reply output is retried without silently discarding existing source comments',async()=>{
+  const oldFetch=globalThis.fetch,h=harness(base());let mainCalls=0;
+  globalThis.fetch=async url=>Response.json(String(url).includes('/comments?') ? {comments:[{id:'real',author:{name:'other'},content:'A substantive reply',replies:[]}]} : {post:post('malformed-replies')});
+  h.obj.env.AI={run:async(_model,input)=>{
+    const payload=JSON.parse(input.messages[1].content);
+    if ('source_text' in payload) {mainCalls++;return {response:JSON.stringify(editorial)};}
+    return {response:'{"summary":"invalid reply output"}'};
+  }};
+  try {
+    const i={...item('malformed-replies'),status:'pending'};delete i.editorial;
+    await assert.rejects(h.obj.prepare(i),/Missing discussion output/);
+    await assert.rejects(h.obj.prepare(i),/Missing discussion output/);
+    assert.equal(mainCalls,1);assert.equal(i.status,'pending');assert.equal(i.editorial,undefined);
+  } finally {globalThis.fetch=oldFetch;}
+});
+
+test('editorial upgrade retries future failed drafts while preserving delivered and ambiguous messages',async()=>{
+  const s=base();s.editorialVersion=EDITORIAL_VERSION-1;
+  s.items=['failed','queued','pending','sent','unknown'].map((status,n)=>({...item('upgrade'+n,Date.now()+INTERVAL),status,attempts:4,nextRetry:Date.now()+DAY,messageId:status==='sent'?71:undefined}));
+  const h=harness(s);let prepared=0;
+  h.obj.prepare=async i=>{prepared++;i.editorial=editorial;i.status='queued';};
+  await h.obj.tick();
+  const saved=h.state();assert.equal(prepared,1);
+  assert.equal(saved.items[0].status,'queued');assert.equal(saved.items[0].attempts,0);
+  assert.equal(saved.items[1].status,'pending');assert.equal(saved.items[2].status,'pending');
+  assert.equal(saved.items[3].status,'sent');assert.equal(saved.items[3].messageId,71);
+  assert.equal(saved.items[4].status,'unknown');
 });

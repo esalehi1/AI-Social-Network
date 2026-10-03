@@ -1,5 +1,5 @@
 import { CATEGORIES, TOPIC_COMMUNITIES, CLASSIFIER_PROMPT, modelText, parseLabels, chooseMix } from './audience.js';
-import { EDITORIAL_VERSION, NARRATOR_PROMPT, selectComments, validateDiscussion, GAMING_POST_ID, GAMING_CORRECTION } from './discussion.js';
+import { EDITORIAL_VERSION, NARRATOR_PROMPT, DISCUSSION_PROMPT, selectComments, validateDiscussion, GAMING_POST_ID, GAMING_CORRECTION, MORNING_POST_ID } from './discussion.js';
 export const MINUTE = 60_000;
 export const DAY = 24 * 60 * MINUTE;
 export const INTERVAL = 90 * MINUTE;
@@ -240,24 +240,64 @@ export class DailyEditor {
     state.nextCollection = state.nextStart - 30 * MINUTE;
     await this.save(state);
   }
+  async mainNarrative(post) {
+    const result = await this.env.AI.run(this.env.AI_MODEL, {
+      messages: [{ role:'system',content:NARRATOR_PROMPT }, { role:'user',content:JSON.stringify({title:post.title,author:post.author?.name,source_text:post.content.slice(0,16000)}) }],
+      max_tokens:2000,temperature:.25,reasoning_effort:'low',
+    });
+    return validateSummary(modelText(result));
+  }
   async prepare(item) {
     const [data, commentsData] = await Promise.all([sourceJSON('/posts/' + item.id), sourceJSON('/posts/' + item.id + '/comments?sort=best&limit=35')]);
     const post = data.post;
     if (!post || post.id !== item.id || post.is_deleted || post.is_spam || !post.content?.trim()) throw new Error('Full source content unavailable');
     const comments = selectComments(commentsData.comments,post.author?.name);
-    const result = await this.env.AI.run(this.env.AI_MODEL, {
-      messages: [{ role: 'system', content: NARRATOR_PROMPT }, { role: 'user', content: JSON.stringify({ title: post.title, author: post.author?.name, source_text: post.content.slice(0,16000), comments }) }],
-      max_tokens: 4200, temperature: 0.25, reasoning_effort: 'low',
-    });
-    const raw = modelText(result);
-    const value = typeof raw === 'string' ? JSON.parse(raw.trim().replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'')) : raw;
-    item.editorial = { ...validateSummary(value), discussion:validateDiscussion(value.discussion,comments) };
+    // Cache the independently sourced main narrative even if reply generation must retry.
+    if (!item.mainEditorial || item.mainEditorialVersion !== EDITORIAL_VERSION) {
+      item.mainEditorial = await this.mainNarrative(post);
+      item.mainEditorialVersion = EDITORIAL_VERSION;
+    }
+    let discussion = [];
+    if (comments.length) {
+      const result = await this.env.AI.run(this.env.AI_MODEL, {
+        messages:[{role:'system',content:DISCUSSION_PROMPT},{role:'user',content:JSON.stringify({source_context:{title:post.title,text:post.content.slice(0,16000)},comments})}],
+        max_tokens:2600,temperature:.25,reasoning_effort:'low',
+      });
+      const raw=modelText(result);
+      const value=typeof raw === 'string' ? JSON.parse(raw.trim().replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'')) : raw;
+      if (!Array.isArray(value?.discussion)) throw new Error('Missing discussion output');
+      discussion=validateDiscussion(value.discussion,comments);
+    }
+    item.editorial = {...item.mainEditorial,discussion};
     item.editorialVersion = EDITORIAL_VERSION;
     item.commentsChecked = comments.length; item.commentsCheckedAt = Date.now();
     // All text and attribution must fit one Telegram post; retry instead of silently dropping the discussion.
     if (renderPost(item).length > 4000) throw new Error('Narrative and discussion exceed message budget');
     item.status = 'queued';
     console.log(JSON.stringify({event:'editorial_ready',id:item.id,version:EDITORIAL_VERSION,replies:item.editorial.discussion.length}));
+  }
+  async correctMixedExample(state) {
+    if (state.morningCorrection?.done || state.morningCorrection?.attempts >= 3) return;
+    const item=state.items.find(i=>i.id===MORNING_POST_ID && i.status==='sent' && i.messageId);
+    if (!item) return;
+    state.morningCorrection ||= {attempts:0};
+    try {
+      const {post}=await sourceJSON('/posts/'+item.id);
+      if (!post || post.id!==item.id || !post.content?.trim() || post.is_deleted || post.is_spam) throw new Error('Correction source unavailable');
+      state.morningCorrection.editorial ||= await this.mainNarrative(post);
+      const revised={...item,editorial:{...state.morningCorrection.editorial,discussion:item.editorial.discussion || []}};
+      if (renderPost(revised).length>4000) throw new Error('Correction exceeds message budget');
+      const response=await fetch(`https://api.telegram.org/bot${this.env.TELEGRAM_BOT_TOKEN}/editMessageText`,{
+        method:'POST',headers:{'Content-Type':'application/json'},signal:AbortSignal.timeout(25000),
+        body:JSON.stringify({chat_id:this.env.TELEGRAM_CHAT_ID,message_id:item.messageId,text:renderPost(revised),parse_mode:'HTML',link_preview_options:{is_disabled:true}}),
+      });
+      const result=await response.json();
+      if (!result.ok && !String(result.description).includes('message is not modified')) throw new Error('Telegram rejected morning edit: '+response.status);
+      item.editorial=revised.editorial;item.editorialVersion=EDITORIAL_VERSION;
+      state.morningCorrection.done=true;
+      console.log(JSON.stringify({event:'example_corrected',id:item.id,messageId:item.messageId,version:EDITORIAL_VERSION}));
+    } catch(error) {state.morningCorrection.attempts++;this.note(state,'morning_correction',error);}
+    await this.save(state);
   }
   async correctPublishedExample(state) {
     if (state.gamingCorrection?.done || state.gamingCorrection?.attempts >= 3) return;
@@ -298,11 +338,13 @@ export class DailyEditor {
     }
     if (data.ok && data.result?.message_id) {
       item.status = 'sent'; item.messageId = data.result.message_id; item.sentAt = Date.now();
+      console.log(JSON.stringify({event:'published',id:item.id,rank:item.rank,messageId:item.messageId,sentAt:item.sentAt}));
     } else if (response.status >= 500) {
       item.status = 'unknown'; this.note(state, 'telegram', new Error('Server error; delivery uncertain, manual reconciliation required'));
     } else {
       item.status = 'failed'; item.failure = `Telegram ${data.error_code || response.status}: ${String(data.description || '').slice(0,200)}`;
       this.note(state, 'telegram', new Error(item.failure));
+      console.log(JSON.stringify({event:'delivery_error',id:item.id,failure:item.failure}));
       if ([401, 403].includes(data.error_code)) state.enabled = false;
     }
     await this.save(state);
@@ -313,7 +355,7 @@ export class DailyEditor {
     const now = Date.now();
     if ((state.editorialVersion || 0) < EDITORIAL_VERSION) {
       for (const item of state.items) {
-        if (['queued','pending'].includes(item.status) && item.dueAt + INTERVAL > now) {
+        if (['queued','pending','failed'].includes(item.status) && item.dueAt + INTERVAL > now) {
           item.status = 'pending'; item.attempts = 0; item.nextRetry = 0; delete item.editorial;
         }
       }
@@ -324,6 +366,7 @@ export class DailyEditor {
     await this.ctx.storage.setAlarm(now + 2 * MINUTE);
     try {
       await this.correctPublishedExample(state);
+      await this.correctMixedExample(state);
       if (state.rebuildRequested) {
         try { await this.rebuild(state,now); }
         catch (error) { this.note(state,'recuration',error); state.enabled = false; await this.save(state); await this.ctx.storage.deleteAlarm(); return; }
