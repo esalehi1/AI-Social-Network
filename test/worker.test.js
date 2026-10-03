@@ -6,10 +6,16 @@ const now = Date.parse('2026-10-03T00:00:00Z');
 const post = (id, extra = {}) => ({ id, title: 'A distinct post ' + id, content: 'source', created_at: new Date(now - MINUTE).toISOString(), upvotes: 100, comment_count: 50, author: { name: 'agent' }, ...extra });
 const editorial = { title: 'چرا خلاصه‌سازی می‌تواند خطا را پنهان کند؟', summary: 'نویسنده در این مطلب توضیح می‌دهد که خلاصه‌سازی پیاپی ممکن است یک خطای کوچک را به اطلاعات پذیرفته‌شده تبدیل کند. وقتی عامل‌های بعدی تنها خلاصهٔ مرحلهٔ قبل را می‌بینند، امکان مراجعه به دادهٔ اصلی را از دست می‌دهند. پیشنهاد مطرح‌شده در نوشته، نگه‌داشتن ارجاع به منبع و بررسی دادهٔ اصلی پیش از تصمیم‌گیری است.' };
 function harness(state) {
-  let stored = structuredClone(state), alarm;
-  const storage = { async get() { return structuredClone(stored); }, async put(_, s) { stored = structuredClone(s); }, async setAlarm(t) { alarm = t; }, async deleteAlarm() { alarm = null; } };
+  const values = new Map([['state', structuredClone(state)]]); let alarm;
+  const storage = {
+    async get(key) { return Array.isArray(key) ? new Map(key.filter(k => values.has(k)).map(k => [k, structuredClone(values.get(k))])) : structuredClone(values.get(key)); },
+    async put(key, value) { for (const [k,v] of typeof key === 'string' ? [[key,value]] : Object.entries(key)) values.set(k,structuredClone(v)); },
+    async delete(keys) { for (const k of keys) values.delete(k); },
+    async transaction(fn) { return fn(storage); },
+    async setAlarm(t) { alarm = t; }, async deleteAlarm() { alarm = null; }
+  };
   const obj = new DailyEditor({ storage }, { TELEGRAM_BOT_TOKEN: 'test', TELEGRAM_CHAT_ID: '-100test', DAILY_START: '04:00' });
-  return { obj, state: () => stored, alarm: () => alarm };
+  return { obj, state: () => { const s = structuredClone(values.get('state')); if (s.itemIds) s.items = s.itemIds.map(id => structuredClone(values.get('item:'+id))); return s; }, alarm: () => alarm };
 }
 const base = () => ({ enabled: true, items: [], seen: [], batches: [], errors: [], lastAttempt: 0, nextCollection: Date.now() + DAY, nextStart: Date.now() + DAY });
 const item = (id, dueAt = Date.now() - MINUTE) => ({ id, post: post(id), editorial, status: 'queued', dueAt, collectedAt: now });

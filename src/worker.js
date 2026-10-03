@@ -74,7 +74,7 @@ export function renderPost(item) {
 }
 
 async function sourceJSON(path) {
-  const response = await fetch(SOURCE + path, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(25_000), redirect: 'error' });
+  const response = await fetch(SOURCE + path, { headers: { Accept: 'application/json', 'User-Agent': 'AI-Social-Network/1.0' }, signal: AbortSignal.timeout(25_000), redirect: 'manual' });
   if (!response.ok) throw new Error(`Moltbook HTTP ${response.status}`);
   const data = await response.json();
   if (data.success === false) throw new Error('Moltbook rejected request');
@@ -91,9 +91,27 @@ export class DailyEditor {
     return task;
   }
   async load() {
-    return await this.ctx.storage.get('state') || { version: 1, enabled: false, items: [], seen: [], batches: [], lastAttempt: 0, nextStart: null, nextCollection: null, errors: [] };
+    const state = await this.ctx.storage.get('state');
+    if (!state) return { version: 2, enabled: false, items: [], seen: [], batches: [], lastAttempt: 0, nextStart: null, nextCollection: null, errors: [] };
+    if (state.itemIds) {
+      const rows = state.itemIds.length ? await this.ctx.storage.get(state.itemIds.map(id => 'item:' + id)) : new Map();
+      state.items = state.itemIds.map(id => rows.get('item:' + id)).filter(Boolean);
+    }
+    return state;
   }
-  async save(state) { await this.ctx.storage.put('state', state); }
+  async save(state) {
+    // Each item has its own key: several days of full text can exceed the 128 KiB per-value limit.
+    const { items, itemIds: _oldIds, ...metadata } = state;
+    await this.ctx.storage.transaction(async tx => {
+      const previous = await tx.get('state');
+      const ids = new Set(items.map(i => i.id));
+      const removed = (previous?.itemIds || []).filter(id => !ids.has(id)).map(id => 'item:' + id);
+      if (removed.length) await tx.delete(removed);
+      const values = Object.fromEntries(items.map(i => ['item:' + i.id, i]));
+      values.state = { ...metadata, version: 2, itemIds: [...ids] };
+      await tx.put(values);
+    });
+  }
   note(state, scope, error) {
     // Never persist credentials or upstream request URLs containing Telegram tokens.
     state.errors.push({ at: Date.now(), scope, message: String(error?.message || error).replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot[redacted]').slice(0,400) });
@@ -111,6 +129,7 @@ export class DailyEditor {
       if (url.pathname === '/start') {
         state.enabled = true;
         if (!state.nextStart) { state.nextStart = nextStart(Date.now(), this.env.DAILY_START); state.nextCollection = Date.now(); }
+        if (!state.batches.length) state.nextCollection = Date.now();
         await this.save(state); await this.ctx.storage.setAlarm(Date.now() + 1000);
         return json({ enabled: true, firstPostAt: state.items.find(i => i.status === 'queued')?.dueAt || state.nextStart });
       }
@@ -127,7 +146,7 @@ export class DailyEditor {
     const feeds = await Promise.allSettled([sourceJSON('/posts?sort=hot&limit=100'), sourceJSON('/posts?sort=rising&limit=100')]);
     const hot = feeds[0].status === 'fulfilled' ? feeds[0].value.posts : [];
     const rising = feeds[1].status === 'fulfilled' ? feeds[1].value.posts : [];
-    if (!hot?.length) throw new Error('Hot feed unavailable; refusing to label an incomplete ranking as daily trends');
+    if (!hot?.length) throw new Error('Hot feed unavailable: ' + (feeds[0].status === 'rejected' ? feeds[0].reason.message : 'empty posts'));
     state.seen = state.seen.filter(x => x.at > now - 30 * DAY);
     const selected = selectPosts(hot, rising || [], state.seen, now);
     if (!selected.length) throw new Error('No fresh unseen trends available');
@@ -135,7 +154,8 @@ export class DailyEditor {
     if (state.nextStart + DAY <= now) state.nextStart = nextStart(now, this.env.DAILY_START);
     const start = state.nextStart;
     for (const [rank, post] of selected.entries()) {
-      state.items.push({ id: post.id, post, rank: rank + 1, batch: start, collectedAt: now,
+      const compact = { id: post.id, title: post.title, author: { name: post.author?.name }, upvotes: post.upvotes, comment_count: post.comment_count, created_at: post.created_at };
+      state.items.push({ id: post.id, post: compact, rank: rank + 1, batch: start, collectedAt: now,
         dueAt: start + rank * INTERVAL, status: 'pending', attempts: 0, nextRetry: 0 });
       state.seen.push({ id: post.id, title: post.title_key, at: now });
     }
@@ -155,7 +175,6 @@ export class DailyEditor {
       max_tokens: 1800, temperature: 0.2,
     });
     item.editorial = validateSummary(result.response || result.choices?.[0]?.message?.content);
-    item.post = { ...item.post, content: post.content };
     item.status = 'queued';
   }
   async publish(item, state, now) {
