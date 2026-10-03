@@ -1,0 +1,17 @@
+{
+  "name": "ai-social-network",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-09-01",
+  "account_id": "253aae9510eab464c1614deca10a33b6",
+  "workers_dev": true,
+  "vars": {
+    "TELEGRAM_CHAT_ID": "-1004414635170",
+    "DAILY_START": "07:00",
+    "AI_MODEL": "@cf/qwen/qwen3-30b-a3b-fp8"
+  },
+  "ai": { "binding": "AI" },
+  "durable_objects": { "bindings": [{ "name": "EDITOR", "class_name": "DailyEditor" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DailyEditor"] }],
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "observability": { "enabled": true }
+}
