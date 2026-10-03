@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import worker, { DailyEditor, nextStart, selectPosts, validateSummary, renderPost, recoverReadySlot, MINUTE, DAY, INTERVAL } from '../src/worker.js';
 import { chooseMix, parseLabels } from '../src/audience.js';
-import { EDITORIAL_VERSION, selectComments, validateDiscussion, GAMING_CORRECTION, MORNING_POST_ID } from '../src/discussion.js';
+import { EDITORIAL_VERSION, selectComments, validateDiscussion, validateIndexedDiscussion, GAMING_CORRECTION, MORNING_POST_ID } from '../src/discussion.js';
+import { GENERATION_VERSION, quotaReset, restoreGeneration, parseModelJSON } from '../src/generation.js';
 
 const now = Date.parse('2026-10-03T00:00:00Z');
 const post = (id, extra = {}) => ({ id, title: 'A distinct post ' + id, content: 'source', created_at: new Date(now - MINUTE).toISOString(), upvotes: 100, comment_count: 50, author: { name: 'agent' }, ...extra });
@@ -19,7 +20,7 @@ function harness(state) {
   const obj = new DailyEditor({ storage }, { TELEGRAM_BOT_TOKEN: 'test', TELEGRAM_CHAT_ID: '-100test', DAILY_START: '04:00' });
   return { obj, state: () => { const s = structuredClone(values.get('state')); if (s.itemIds) s.items = s.itemIds.map(id => structuredClone(values.get('item:'+id))); return s; }, alarm: () => alarm };
 }
-const base = () => ({ editorialVersion: EDITORIAL_VERSION, enabled: true, items: [], seen: [], batches: [], errors: [], lastAttempt: 0, nextCollection: Date.now() + DAY, nextStart: Date.now() + DAY });
+const base = () => ({ generationVersion:GENERATION_VERSION, editorialVersion: EDITORIAL_VERSION, enabled: true, items: [], seen: [], batches: [], errors: [], lastAttempt: 0, nextCollection: Date.now() + DAY, nextStart: Date.now() + DAY });
 const item = (id, dueAt = Date.now() - MINUTE) => ({ id, post: post(id), editorial, status: 'queued', dueAt, collectedAt: now });
 
 test('failed current slot uses a ready future story once without another AI request', async () => {
@@ -249,7 +250,7 @@ test('main model never receives replies, and a reply retry reuses the cached mai
     replyCalls++;
     assert.equal(data.comments[0].text,'REPLY_ONLY_SENTINEL');
     if (replyCalls===1) throw new Error('Temporary reply failure');
-    return {response:JSON.stringify({discussion:[{id:'comment',summary:'می‌گه انسانش ترجیح می‌ده خودش تصمیم بگیره و ربات فقط وقتی ازش کمک می‌خوان وارد ماجرا بشه.'}]})};
+    return {response:JSON.stringify({discussion:[{i:0,summary:'می‌گه انسانش ترجیح می‌ده خودش تصمیم بگیره و ربات فقط وقتی ازش کمک می‌خوان وارد ماجرا بشه.'}]})};
   }};
   const i=item('isolated');
   try {
@@ -325,4 +326,85 @@ test('editorial upgrade retries future failed drafts while preserving delivered 
   assert.equal(saved.items[1].status,'pending');assert.equal(saved.items[2].status,'pending');
   assert.equal(saved.items[3].status,'sent');assert.equal(saved.items[3].messageId,71);
   assert.equal(saved.items[4].status,'unknown');
+});
+
+test('indexed reply citations resolve only to real records and reject duplicate or invented references',()=>{
+  const summary='می‌گه انسانش ترجیح می‌ده خودش تصمیم بگیره و ربات فقط وقتی ازش کمک می‌خوان وارد ماجرا بشه.';
+  const sources=[{id:'real-uuid',author:'actual-author',parent_id:'parent',parent_author:'actual-parent'}];
+  const [reply]=validateIndexedDiscussion([{i:0,author:'invented',summary}],sources);
+  assert.equal(reply.id,'real-uuid');assert.equal(reply.author,'actual-author');assert.equal(reply.parent_author,'actual-parent');
+  for (const i of [-1,1,'0',.5]) assert.throws(()=>validateIndexedDiscussion([{i,summary}],sources));
+  assert.throws(()=>validateIndexedDiscussion([{i:0,summary},{i:0,summary}],sources),/duplicate/);
+});
+
+test('JSON parser accepts provider objects and reasoning/fences but never fabricates malformed output',()=>{
+  assert.deepEqual(parseModelJSON(editorial),editorial);
+  assert.deepEqual(parseModelJSON('<think>reasoning</think>\n```json\n'+JSON.stringify(editorial)+'\n```'),editorial);
+  for(const raw of ['!!!!!!!!!!','{"title":"cut off"','[]','null']) assert.throws(()=>parseModelJSON(raw));
+});
+
+test('valid main narrative is durable before replies and survives a new object after failure',async()=>{
+  const s=base(),i={...item('checkpoint',Date.now()+INTERVAL),status:'pending',attempts:0,nextRetry:0};delete i.editorial;s.items=[i];
+  const h=harness(s),oldFetch=globalThis.fetch;let mains=0,replies=0;
+  globalThis.fetch=async url=>Response.json(String(url).includes('/comments?') ? {comments:[{id:'actual-id',content:'A useful reply',author:{name:'real'},replies:[]}]} : {post:post(i.id)});
+  const run=async(_model,input)=>{
+    assert.equal(input.response_format.type,'json_schema');
+    const data=JSON.parse(input.messages[1].content);
+    if(data.source_text){mains++;assert.ok(!data.comments);return {response:editorial};}
+    replies++;assert.equal(data.comments[0].i,0);assert.equal(data.comments[0].id,undefined);
+    assert.deepEqual(input.response_format.json_schema.properties.discussion.items.properties.i.enum,[0]);
+    assert.equal(h.state().items[0].mainEditorial.summary,editorial.summary);
+    if(replies===1)throw new Error('Reply failure after checkpoint');
+    return {output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({discussion:[{i:0,summary:'می‌گه انسانش ترجیح می‌ده خودش تصمیم بگیره و ربات فقط وقتی ازش کمک می‌خوان وارد ماجرا بشه.'}]})}]}]};
+  };
+  try {
+    h.obj.env.AI={run};await assert.rejects(h.obj.prepare(i,s),/checkpoint/);
+    const reloaded=await h.obj.load();
+    const restarted=new DailyEditor(h.obj.ctx,{...h.obj.env,AI:{run}});
+    await restarted.prepare(reloaded.items[0],reloaded);
+    assert.equal(mains,1);assert.equal(replies,2);assert.equal(reloaded.items[0].status,'queued');
+  } finally {globalThis.fetch=oldFetch;}
+});
+
+test('daily quota waits until UTC reset without burning retry attempts and prepared posts still publish',async()=>{
+  const at=Date.now(),s=base();
+  s.items=[{...item('draft',at+2*INTERVAL),status:'pending',attempts:3,nextRetry:0,editorial:undefined},
+    {...item('ready',at+INTERVAL),category:'human'}];
+  const h=harness(s);let generationCalls=0,deliveries=0;const oldFetch=globalThis.fetch;
+  h.obj.env.AI={run:async()=>{generationCalls++;throw new Error('4006: you have used up your daily free allocation of 10,000 neurons');}};
+  h.obj.prepare=async(_i,state)=>h.obj.runAI('model',{},state);
+  globalThis.fetch=async()=>{deliveries++;return Response.json({ok:true,result:{message_id:900}});};
+  try {
+    await h.obj.tick();await h.obj.tick();
+    let saved=h.state();assert.equal(saved.items[0].attempts,3);assert.equal(saved.items[0].status,'pending');
+    assert.equal(saved.aiBlockedUntil,quotaReset(at));assert.equal(saved.items[0].nextRetry,saved.aiBlockedUntil);assert.equal(generationCalls,1);
+    saved.items[1].dueAt=at-MINUTE;await h.obj.save(saved);await h.obj.tick();
+    assert.equal(deliveries,1);assert.equal(h.state().items[1].status,'sent');assert.equal(generationCalls,1);
+    saved=h.state();saved.aiBlockedUntil=at-MINUTE;saved.items[0].nextRetry=0;await h.obj.save(saved);
+    h.obj.env.AI.run=async()=>({response:'ok'});h.obj.prepare=async(i,state)=>{await h.obj.runAI('model',{},state);i.status='queued';i.editorial=editorial;};
+    await h.obj.tick();assert.equal(h.state().items[0].status,'queued');
+  }finally{globalThis.fetch=oldFetch;}
+});
+
+test('generation migration restores only eligible failed drafts and honors the already exhausted daily quota',()=>{
+  const at=Date.now(),s=base();delete s.generationVersion;
+  s.errors=[{at,message:'4006: daily free allocation exhausted'}];
+  s.items=[{...item('failed',at+INTERVAL),status:'failed',attempts:4,editorial:undefined},
+    {...item('old',at-2*INTERVAL),status:'failed',editorial:undefined},
+    {...item('delivery',at+INTERVAL),status:'failed',failure:'Telegram 403'},
+    {...item('ready',at+INTERVAL)}, {...item('sent'),status:'sent',messageId:7}, {...item('unknown'),status:'unknown'}];
+  const before=structuredClone(s.items.slice(1));
+  assert.equal(restoreGeneration(s,at),true);assert.equal(s.items[0].status,'pending');assert.equal(s.items[0].attempts,0);
+  assert.equal(s.items[0].nextRetry,quotaReset(at));assert.deepEqual(s.items.slice(1),before);
+  assert.equal(restoreGeneration(s,at),false);
+  const fresh=base();delete fresh.generationVersion;fresh.errors=[{at:at-DAY,message:'4006'}];
+  restoreGeneration(fresh,at);assert.equal(fresh.aiBlockedUntil,undefined);
+});
+
+test('collection quota does not retry upstream AI before reset',async()=>{
+  const s=base();s.nextCollection=0;const h=harness(s);let calls=0;
+  h.obj.collect=async(state)=>{calls++;await h.obj.runAI('model',{},state);};
+  h.obj.env.AI={run:async()=>{throw new Error('4006: daily free allocation exhausted');}};
+  await h.obj.tick();await h.obj.tick();
+  assert.equal(calls,1);assert.equal(h.state().nextCollection,h.state().aiBlockedUntil);
 });

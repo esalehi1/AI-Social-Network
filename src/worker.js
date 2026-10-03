@@ -1,5 +1,6 @@
 import { CATEGORIES, TOPIC_COMMUNITIES, CLASSIFIER_PROMPT, modelText, parseLabels, chooseMix } from './audience.js';
-import { EDITORIAL_VERSION, NARRATOR_PROMPT, DISCUSSION_PROMPT, selectComments, validateDiscussion, GAMING_POST_ID, GAMING_CORRECTION, MORNING_POST_ID } from './discussion.js';
+import { EDITORIAL_VERSION, NARRATOR_PROMPT, DISCUSSION_PROMPT, selectComments, validateDiscussion, validateIndexedDiscussion, GAMING_POST_ID, GAMING_CORRECTION, MORNING_POST_ID } from './discussion.js';
+import { GENERATION_VERSION, MAIN_FORMAT, discussionFormat, parseModelJSON, isDailyQuotaError, quotaReset, restoreGeneration } from './generation.js';
 export const MINUTE = 60_000;
 export const DAY = 24 * 60 * MINUTE;
 export const INTERVAL = 90 * MINUTE;
@@ -62,11 +63,7 @@ export function selectPosts(hot, rising, seen, now, count = DAILY_COUNT) {
 }
 
 export function validateSummary(raw) {
-  let value = typeof raw === 'string' ? raw.replace(/<think>[\s\S]*?<\/think>/g, '').trim() : raw;
-  if (typeof value === 'string') {
-    value = value.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
-    value = JSON.parse(value);
-  }
+  const value = parseModelJSON(raw);
   if (!value || typeof value.title !== 'string' || typeof value.summary !== 'string') throw new Error('Invalid editorial JSON');
   const clean = s => s.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u202a-\u202e\u2066-\u2069]/g, '').trim();
   const title = clean(value.title), summary = clean(value.summary);
@@ -139,11 +136,22 @@ export class DailyEditor {
     state.errors.push({ at: Date.now(), scope, message: String(error?.message || error).replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot[redacted]').slice(0,400) });
     state.errors = state.errors.slice(-20);
   }
+  async runAI(model, input, state) {
+    if (state?.aiBlockedUntil > Date.now()) throw new Error('Daily AI quota exhausted (4006); waiting for reset');
+    try { return await this.env.AI.run(model,input); }
+    catch (error) {
+      if (state && isDailyQuotaError(error)) {
+        state.aiBlockedUntil = quotaReset(Date.now());
+        await this.save(state);
+      }
+      throw error;
+    }
+  }
   async fetch(request) {
     return this.locked(async () => {
       const url = new URL(request.url), state = await this.load();
       if (url.pathname === '/status') {
-        return json({ enabled: state.enabled, nextCollection: state.nextCollection, nextStart: state.nextStart,
+        return json({ enabled: state.enabled, nextCollection: state.nextCollection, nextStart: state.nextStart, generationVersion:state.generationVersion, aiBlockedUntil:state.aiBlockedUntil || null,
           lastAttempt: state.lastAttempt, audiencePolicy: 'general>=70%; technical<=30%', rebuildRequested: state.rebuildRequested || null, batches: state.batches.slice(-5), errors: state.errors,
           items: state.items.map(({ post, editorial, ...i }) => ({ ...i, title: editorial?.title || post.title, source: `https://www.moltbook.com/post/${post.id}`, text: editorial ? renderPost({ ...i, post, editorial }) : null })) });
       }
@@ -180,7 +188,8 @@ export class DailyEditor {
     });
   }
   async alarm() { return this.locked(() => this.tick()); }
-  async discover(seen, now) {
+  async discover(seen, now, state) {
+    if (state?.aiBlockedUntil > Date.now()) throw new Error('Daily AI quota exhausted (4006); waiting for reset');
     const paths = ['/posts?sort=hot&limit=100', '/posts?sort=rising&limit=100',
       ...TOPIC_COMMUNITIES.flatMap(name => ['hot','new'].map(sort => `/posts?submolt=${name}&sort=${sort}&limit=25`))];
     const feeds = await Promise.allSettled(paths.map(sourceJSON));
@@ -202,11 +211,11 @@ export class DailyEditor {
     // Keep each response bounded; do not trust labels or IDs invented by the model.
     for (let offset = 0; offset < all.length; offset += 30) {
       const chunk = all.slice(offset,offset + 30);
-      const result = await this.env.AI.run(this.env.CLASSIFIER_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
+      const result = await this.runAI(this.env.CLASSIFIER_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
         messages: [{ role: 'system', content: CLASSIFIER_PROMPT }, { role: 'user', content: JSON.stringify(chunk.map((p,i) => ({ i, title:p.title, text: String(p.content || '').slice(0,650), community:p.submolt?.name }))) }],
         max_tokens: 2400, temperature: .1, reasoning_effort: 'low',
         response_format: { type:'json_schema', json_schema:{ type:'object', properties:{ items:{ type:'array',items:{ type:'object',properties:{ i:{type:'integer'},category:{type:'string',enum:[...CATEGORIES,'skip']},appeal:{type:'integer',minimum:1,maximum:5}},required:['i','category','appeal'],additionalProperties:false}}},required:['items'],additionalProperties:false}},
-      });
+      }, state);
       classified.push(...parseLabels(modelText(result),chunk));
     }
     return { candidates: classified, hotCount: hot.length, risingCount: rising?.length || 0, screenedCount: all.length };
@@ -228,7 +237,7 @@ export class DailyEditor {
     fixed.forEach(i => { i.category ||= 'technical'; });
     const removed = new Set(state.items.filter(i => i.batch === start && !fixed.includes(i)).map(i => i.id));
     const seen = state.seen.filter(i => !removed.has(i.id));
-    const report = await this.discover(seen,now);
+    const report = await this.discover(seen,now,state);
     const slots = Array.from({length:DAILY_COUNT},(_,i)=>i).filter(i => start+i*INTERVAL >= now && !fixed.some(p => p.rank === i+1));
     const selected = chooseMix(report.candidates, fixed.length+slots.length, fixed);
     if (!selected.length) throw new Error('No suitable general-audience stories; old queue kept paused');
@@ -243,7 +252,7 @@ export class DailyEditor {
   }
   async collect(state, now) {
     state.seen = state.seen.filter(x => x.at > now - 30 * DAY);
-    const report = await this.discover(state.seen,now);
+    const report = await this.discover(state.seen,now,state);
     const selected = chooseMix(report.candidates);
     if (!selected.length) throw new Error('No fresh general-audience trends available');
     // If a service outage spans days, resume with the next cycle instead of flooding old posts.
@@ -259,39 +268,41 @@ export class DailyEditor {
     state.nextCollection = state.nextStart - 30 * MINUTE;
     await this.save(state);
   }
-  async mainNarrative(post) {
-    const result = await this.env.AI.run(this.env.AI_MODEL, {
+  async mainNarrative(post, state) {
+    const result = await this.runAI(this.env.AI_MODEL, {
       messages: [{ role:'system',content:NARRATOR_PROMPT }, { role:'user',content:JSON.stringify({title:post.title,author:post.author?.name,source_text:post.content.slice(0,16000)}) }],
-      max_tokens:2000,temperature:.25,reasoning_effort:'low',
-    });
+      max_tokens:2000,temperature:.25,reasoning_effort:'low',response_format:MAIN_FORMAT,
+    }, state);
     return validateSummary(modelText(result));
   }
-  async prepare(item) {
+  async prepare(item, state) {
     const [data, commentsData] = await Promise.all([sourceJSON('/posts/' + item.id), sourceJSON('/posts/' + item.id + '/comments?sort=best&limit=35')]);
     const post = data.post;
     if (!post || post.id !== item.id || post.is_deleted || post.is_spam || !post.content?.trim()) throw new Error('Full source content unavailable');
-    const comments = selectComments(commentsData.comments,post.author?.name);
+    const comments = selectComments(commentsData.comments,post.author?.name,12).map(c=>({...c,text:c.text.slice(0,1200)}));
     // Cache the independently sourced main narrative even if reply generation must retry.
     if (!item.mainEditorial || item.mainEditorialVersion !== EDITORIAL_VERSION) {
-      item.mainEditorial = await this.mainNarrative(post);
+      item.mainEditorial = await this.mainNarrative(post,state);
       item.mainEditorialVersion = EDITORIAL_VERSION;
+      if (state) await this.save(state); // Survive a crash while generating replies.
     }
     let discussion = [];
     if (comments.length) {
-      const result = await this.env.AI.run(this.env.AI_MODEL, {
-        messages:[{role:'system',content:DISCUSSION_PROMPT},{role:'user',content:JSON.stringify({source_context:{title:post.title,text:post.content.slice(0,16000)},comments})}],
-        max_tokens:2600,temperature:.25,reasoning_effort:'low',
-      });
-      const raw=modelText(result);
-      const value=typeof raw === 'string' ? JSON.parse(raw.trim().replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'')) : raw;
-      if (!Array.isArray(value?.discussion)) throw new Error('Missing discussion output');
-      discussion=validateDiscussion(value.discussion,comments);
+      const indexed = comments.map((c,i)=>({i,author:c.author,parent_i:comments.findIndex(p=>p.id===c.parent_id),parent_author:c.parent_author,text:c.text}));
+      const result = await this.runAI(this.env.AI_MODEL, {
+        messages:[{role:'system',content:DISCUSSION_PROMPT},{role:'user',content:JSON.stringify({source_context:{title:post.title,text:post.content.slice(0,16000)},comments:indexed})}],
+        max_tokens:2200,temperature:.25,reasoning_effort:'low',response_format:discussionFormat(comments.length),
+      }, state);
+      discussion=validateIndexedDiscussion(parseModelJSON(modelText(result)).discussion,comments);
     }
     item.editorial = {...item.mainEditorial,discussion};
     item.editorialVersion = EDITORIAL_VERSION;
     item.commentsChecked = comments.length; item.commentsCheckedAt = Date.now();
     // All text and attribution must fit one Telegram post; retry instead of silently dropping the discussion.
-    if (renderPost(item).length > 4000) throw new Error('Narrative and discussion exceed message budget');
+    if (renderPost(item).length > 4000) {
+      delete item.editorial;
+      throw new Error('Narrative and discussion exceed message budget');
+    }
     item.status = 'queued';
     console.log(JSON.stringify({event:'editorial_ready',id:item.id,version:EDITORIAL_VERSION,replies:item.editorial.discussion.length}));
   }
@@ -303,7 +314,7 @@ export class DailyEditor {
     try {
       const {post}=await sourceJSON('/posts/'+item.id);
       if (!post || post.id!==item.id || !post.content?.trim() || post.is_deleted || post.is_spam) throw new Error('Correction source unavailable');
-      state.morningCorrection.editorial ||= await this.mainNarrative(post);
+      state.morningCorrection.editorial ||= await this.mainNarrative(post,state);
       const revised={...item,editorial:{...state.morningCorrection.editorial,discussion:item.editorial.discussion || []}};
       if (renderPost(revised).length>4000) throw new Error('Correction exceeds message budget');
       const response=await fetch(`https://api.telegram.org/bot${this.env.TELEGRAM_BOT_TOKEN}/editMessageText`,{
@@ -315,7 +326,7 @@ export class DailyEditor {
       item.editorial=revised.editorial;item.editorialVersion=EDITORIAL_VERSION;
       state.morningCorrection.done=true;
       console.log(JSON.stringify({event:'example_corrected',id:item.id,messageId:item.messageId,version:EDITORIAL_VERSION}));
-    } catch(error) {state.morningCorrection.attempts++;this.note(state,'morning_correction',error);}
+    } catch(error) {if (!isDailyQuotaError(error)) state.morningCorrection.attempts++;this.note(state,'morning_correction',error);}
     await this.save(state);
   }
   async correctPublishedExample(state) {
@@ -370,9 +381,10 @@ export class DailyEditor {
   }
   async tick() {
     const state = await this.load();
-    console.log(JSON.stringify({event:'queue_snapshot',enabled:state.enabled,lastAttempt:state.lastAttempt,slots:state.items.map(i=>({id:i.id,rank:i.rank,batch:i.batch,dueAt:i.dueAt,status:i.status,category:i.category,ready:!!i.editorial,messageId:i.messageId,attempts:i.attempts,failure:i.failure})),errors:state.errors.slice(-5)}));
+    console.log(JSON.stringify({event:'queue_snapshot',enabled:state.enabled,lastAttempt:state.lastAttempt,generationVersion:state.generationVersion,aiBlockedUntil:state.aiBlockedUntil,slots:state.items.map(i=>({id:i.id,rank:i.rank,batch:i.batch,dueAt:i.dueAt,status:i.status,category:i.category,ready:!!i.editorial,messageId:i.messageId,attempts:i.attempts,failure:i.failure,nextRetry:i.nextRetry})),errors:state.errors.slice(-5)}));
     if (!state.enabled) return;
     const now = Date.now();
+    if (restoreGeneration(state,now)) await this.save(state);
     if ((state.editorialVersion || 0) < EDITORIAL_VERSION) {
       for (const item of state.items) {
         if (['queued','pending','failed'].includes(item.status) && item.dueAt + INTERVAL > now) {
@@ -397,7 +409,7 @@ export class DailyEditor {
       }
       if (now >= state.nextCollection) {
         try { await this.collect(state, now); }
-        catch (error) { this.note(state, 'collection', error); state.nextCollection = now + 15 * MINUTE; }
+        catch (error) { this.note(state, 'collection', error); state.nextCollection = isDailyQuotaError(error) ? (state.aiBlockedUntil || quotaReset(now)) : now + 15 * MINUTE; }
       }
       const recovered = recoverReadySlot(state,now);
       if (recovered) {
@@ -411,22 +423,27 @@ export class DailyEditor {
         if (due.category === 'technical' && (technical+1)/(delivered.length+1) > .3) due.status = 'skipped_quota';
         else await this.publish(due, state, now);
       }
-      const pending = state.items.find(i => i.status === 'pending' && i.nextRetry <= now);
+      const pending = !(state.aiBlockedUntil > now) && state.items.find(i => i.status === 'pending' && i.nextRetry <= now);
       if (pending) {
-        try { await this.prepare(pending); }
+        try { await this.prepare(pending,state); }
         catch (error) {
-          pending.attempts++; pending.nextRetry = Date.now() + Math.min(30, 2 ** pending.attempts) * MINUTE;
+          if (isDailyQuotaError(error)) {
+            if (!(state.aiBlockedUntil > Date.now())) state.aiBlockedUntil = quotaReset(Date.now());
+            pending.nextRetry = state.aiBlockedUntil;
+          } else {
+            pending.attempts++; pending.nextRetry = Date.now() + Math.min(30, 2 ** pending.attempts) * MINUTE;
+            if (pending.attempts >= 4) pending.status = 'failed';
+          }
           this.note(state, 'editorial', error);
-          if (pending.attempts >= 4) pending.status = 'failed';
         }
       }
       await this.save(state);
     } catch (error) { this.note(state, 'tick', error); await this.save(state); }
     if (state.enabled) {
-      const soon = state.items.some(i => i.status === 'pending' && i.nextRetry <= Date.now());
+      const soon = !(state.aiBlockedUntil > Date.now()) && state.items.some(i => i.status === 'pending' && i.nextRetry <= Date.now());
       const events = [Date.now() + (soon ? 1000 : 5 * MINUTE), state.nextCollection,
         ...state.items.filter(i => i.status === 'queued').map(i => Math.max(i.dueAt, state.lastAttempt + INTERVAL)),
-        ...state.items.filter(i => i.status === 'pending').map(i => i.nextRetry)];
+        ...state.items.filter(i => i.status === 'pending').map(i => Math.max(i.nextRetry,state.aiBlockedUntil || 0))];
       await this.ctx.storage.setAlarm(Math.max(Date.now() + 1000, Math.min(...events.filter(t => t > Date.now()))));
     } else await this.ctx.storage.deleteAlarm();
   }
@@ -446,7 +463,7 @@ function editor(env) { return env.EDITOR.get(env.EDITOR.idFromName('main')); }
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (url.pathname === '/health') return json({ ok: true, service: 'ai-social-network', source: 'Moltbook', editorialVersion: EDITORIAL_VERSION });
+    if (url.pathname === '/health') return json({ ok: true, service: 'ai-social-network', source: 'Moltbook', editorialVersion: EDITORIAL_VERSION, generationVersion: GENERATION_VERSION });
     if (!url.pathname.startsWith('/admin/')) return json({ error: 'Not found' }, 404);
     if (!await authorized(request, env)) return json({ error: 'Unauthorized' }, 401);
     const path = url.pathname.replace('/admin', '');
